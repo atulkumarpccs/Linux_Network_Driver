@@ -1,0 +1,588 @@
+/*
+ * drivers/si53xx_i2c.c
+ *
+ * Network Timing Module Si53xx I2C interface driver
+ *
+ * Author: Atul Kumar <atul_kumar@mindtree.com>
+ *
+ * This file is licensed under
+ * the terms of the GNU General Public License version 2. This program
+ * is licensed "as is" without any warranty of any kind, whether express
+ * or implied.
+ */
+
+#include <linux/autoconf.h>
+#include <linux/version.h>
+#include <linux/device.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/i2c.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/poll.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <asm/signal.h>
+#include <linux/slab.h>
+
+#include <asm/io.h>
+#include <asm/uaccess.h>
+
+#define DRIVER_NAME "si53xx"
+
+/* SI53XX ID register locations */
+#define SI53XX_REG_ID_1      134
+#define SI53XX_REG_ID_2      135
+                                           
+/* SI53XX Interrupt register mask and clear registers */
+#define SI53XX_REG_INT_MSK1  23
+#define SI53XX_REG_INT_MSK2  24
+#define SI53XX_REG_INT_CLR1  131
+#define SI53XX_REG_INT_CLR2  132
+
+#define SI53XX_NUM_REGS      256
+
+#define SI53xx_INIT_WORK(_t, _f, _d) INIT_WORK((_t), (_f));
+
+struct si53xx_data {
+        struct i2c_client *client;
+        struct cdev cdev;
+        struct device *dev;
+        int si53xx_minor;
+        wait_queue_head_t inq;
+
+        spinlock_t si53xx_lock;
+
+        struct workqueue_struct *workqueue;
+        struct work_struct si53xx_intr_workq;
+
+        int intr_flag;
+        int si53xx_open_count;
+        int chip_id;
+        int chip_revision;
+};
+
+static int si53xx_major;
+static int si53xx_minor_count = 0;
+
+static int __init i2c_si53xx_init(void);
+static void __exit i2c_si53xx_exit(void);
+
+/* Forward method declarations for cdev */
+static int si53xx_open(struct inode *inode, struct file *filp);
+static ssize_t si53xx_read(struct file *filp, char __user *buff,
+                            size_t count, loff_t *offp);
+static ssize_t si53xx_write(struct file *filp, const char __user *buff,
+                             size_t count, loff_t *offp);
+static int si53xx_release(struct inode *inode, struct file *filp);
+static unsigned int si53xx_poll(struct file *filp, poll_table *wait);
+
+/* Internal functions */
+static int si53xx_read_block_data(struct i2c_client *client, u8 command,u8 length, u8 *values);
+static int si53xx_write_block_data(struct i2c_client *client, u8 command,u8 length, const u8 *values);
+
+static struct file_operations si53xx_fops = {
+        .owner = THIS_MODULE,
+        .open = si53xx_open,
+        .read = si53xx_read,
+        .write = si53xx_write,
+        .release = si53xx_release,
+        .poll = si53xx_poll,
+};
+
+static int si53xx_read_block_data(struct i2c_client *client,u8 command, u8 length, u8 *values)
+{
+        s32 i, data;
+
+        for (i = 0; i < length; i++) {
+                data = i2c_smbus_read_byte_data(client, command + i);
+                if (data < 0){
+                     printk(KERN_ERR "%s: Error when reading: %d\n", __FILE__, data);
+                     return data;
+              }
+                values[i] = data;
+        }
+        return length;
+}
+static irqreturn_t si53xx_interrupt(int irq, void *dev_id)
+{
+    struct si53xx_data *drv_data=(struct si53xx_data *)dev_id;
+    int rc = 0;
+
+    /* queue_work() returns non-zero value if work is queued successfully. 
+       queue_work() will return 0 if the work is already queued */
+    rc = queue_work(drv_data->workqueue, &drv_data->si53xx_intr_workq);
+
+    /* disable the irq only if work is queued successfully*/
+    printk("si53xx_interrupt \n");
+    if (rc == 1)
+    {
+        /**
+         * since 2.6.34 at least, the disable_irq() can not be called from the interrupt handler
+         * otherwise, there will be deadlock, check the usage of irq_desc.threads_active(include/linux/irq.h)
+         * no need to disable the IRQ since only one task is queued
+         */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34)
+        disable_irq(drv_data->client->irq);
+#endif
+        return IRQ_HANDLED;
+    }
+
+    printk(KERN_DEBUG "%s:%d queue_work returned %d\n", __FUNCTION__, __LINE__, rc);
+
+    return IRQ_RETVAL(rc);
+}
+
+static int si53xx_open(struct inode *inode, struct file *filp)
+{
+        struct si53xx_data *drv_data = container_of(inode->i_cdev,struct si53xx_data, cdev);
+        unsigned long flags;
+        int err;
+        filp->private_data = drv_data;
+
+        spin_lock_irqsave(&drv_data->si53xx_lock, flags);
+        drv_data->si53xx_open_count++;
+        spin_unlock_irqrestore(&drv_data->si53xx_lock, flags);
+
+        if( drv_data->si53xx_open_count == 1 ) {
+                drv_data->workqueue = create_singlethread_workqueue(DRIVER_NAME);
+
+                if(drv_data->client->irq) {
+                        err = request_irq(drv_data->client->irq, si53xx_interrupt, 0,
+                                DRIVER_NAME, drv_data);
+                        if( err < 0 ) {
+                                printk("%s: request irq failed\n", DRIVER_NAME);
+                        }
+                }
+        }
+
+        return 0;
+}
+
+static int si53xx_release(struct inode *inode, struct file *filp)
+{
+        struct si53xx_data *drv_data = container_of(inode->i_cdev,
+                struct si53xx_data, cdev);
+        u8 writeData = 0xff;
+        filp->private_data = drv_data;
+
+        if( drv_data->si53xx_open_count == 1 ) {
+        /* Disable interrupts */
+        i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_MSK1, writeData);
+        i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_MSK2, writeData);
+        if(drv_data->client->irq)
+                free_irq(drv_data->client->irq, drv_data);
+
+                destroy_workqueue(drv_data->workqueue);
+        }
+
+        spin_lock(&drv_data->si53xx_lock);
+        drv_data->si53xx_open_count--;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        return 0;
+}
+
+static void si53xx_intr_handler(struct work_struct *workq)
+{
+    struct si53xx_data *drv_data = container_of(workq, struct si53xx_data, si53xx_intr_workq);
+    u8 writeData = 0x0;
+    u8 readData[2];
+
+    readData[0] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR1);
+    readData[1] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR2);
+
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR1, writeData);
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR2, writeData);
+
+
+    spin_lock(&drv_data->si53xx_lock);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR1, readData[0]);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR2, readData[1]);
+
+    drv_data->intr_flag = 1;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        wake_up_interruptible(&drv_data->inq);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34)
+        enable_irq(drv_data->client->irq);
+#endif
+}
+
+        }
+
+        spin_lock(&drv_data->si53xx_lock);
+        drv_data->si53xx_open_count--;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        return 0;
+}
+
+static void si53xx_intr_handler(struct work_struct *workq)
+{
+    struct si53xx_data *drv_data = container_of(workq, struct si53xx_data, si53xx_intr_workq);
+    u8 writeData = 0x0;
+    u8 readData[2];
+
+    readData[0] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR1);
+    readData[1] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR2);
+
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR1, writeData);
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR2, writeData);
+
+
+    spin_lock(&drv_data->si53xx_lock);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR1, readData[0]);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR2, readData[1]);
+
+    drv_data->intr_flag = 1;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        wake_up_interruptible(&drv_data->inq);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34)
+        enable_irq(drv_data->client->irq);
+#endif
+}
+
+        }
+
+        spin_lock(&drv_data->si53xx_lock);
+        drv_data->si53xx_open_count--;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        return 0;
+}
+
+static void si53xx_intr_handler(struct work_struct *workq)
+{
+    struct si53xx_data *drv_data = container_of(workq, struct si53xx_data, si53xx_intr_workq);
+    u8 writeData = 0x0;
+    u8 readData[2];
+
+    readData[0] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR1);
+    readData[1] = i2c_smbus_read_byte_data(drv_data->client, SI53XX_REG_INT_CLR2);
+
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR1, writeData);
+    i2c_smbus_write_byte_data(drv_data->client, SI53XX_REG_INT_CLR2, writeData);
+
+
+    spin_lock(&drv_data->si53xx_lock);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR1, readData[0]);
+    printk("%s: Interrupt reg[%d]=0x%x\n", DRIVER_NAME, SI53XX_REG_INT_CLR2, readData[1]);
+
+    drv_data->intr_flag = 1;
+        spin_unlock(&drv_data->si53xx_lock);
+
+        wake_up_interruptible(&drv_data->inq);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34)
+        enable_irq(drv_data->client->irq);
+#endif
+}
+
+static ssize_t si53xx_read(struct file *filp, char __user *buff,
+                                size_t count, loff_t *offp)
+{
+    struct si53xx_data *drv_data = filp->private_data;
+    s32 status;
+    u8 read_buff[SI53XX_NUM_REGS] = {0};
+
+    count = min((int)count, SI53XX_NUM_REGS-((int)(*offp)));
+    if(count == 0)
+        return 0;
+
+    *offp = (*offp) & 0xff;
+
+    status = si53xx_read_block_data(drv_data->client, *offp, count, read_buff);
+    if(status <= 0) {
+        printk(KERN_ERR "%s: Error reading registers: %d\n", DRIVER_NAME, status);
+        return status;
+    }
+
+    if(copy_to_user(buff, read_buff, count))
+       return -EFAULT;
+
+    *offp += status;
+
+    return status;
+}
+
+static ssize_t si53xx_write(struct file *filp, const char __user *buff,
+                                                         size_t count, loff_t *offp)
+{
+    struct si53xx_data *drv_data = filp->private_data;
+    s32 status;
+    u8 write_buff[SI53XX_NUM_REGS];
+
+    count = min((int)count, SI53XX_NUM_REGS-((int)(*offp)));
+    if(count == 0)
+        return 0;
+    *offp = (*offp) & 0xff;
+    if(copy_from_user(write_buff, buff, count))
+       return -EFAULT;
+
+    status = si53xx_write_block_data(drv_data->client, *offp, count, write_buff);
+    if(status <=  0) {
+        printk(KERN_ERR "%s: Error writing registers: %d\n", DRIVER_NAME, status);
+        return status;
+    }
+
+    *offp += status;
+
+    return status;
+}
+
+static unsigned int si53xx_poll(struct file *filp, poll_table *wait)
+{
+    struct si53xx_data *drv_data = filp->private_data;
+    unsigned long flags;
+    
+    spin_lock_irqsave(&drv_data->si53xx_lock, flags);
+    if( drv_data->intr_flag ) {
+         drv_data->intr_flag = 0;
+         spin_unlock_irqrestore(&drv_data->si53xx_lock, flags);
+         return POLLPRI;
+    }
+    spin_unlock_irqrestore(&drv_data->si53xx_lock, flags);
+    
+    poll_wait(filp, &drv_data->inq, wait);
+
+    /* if an interrupt occured, then return poll high priority High-priority
+       data (out-of-band) can be read without blocking.  This bit causes select
+       to report that an exception condition occurred on the file, because
+       select reports out-of-band data as an exception condition.
+    */
+    spin_lock_irqsave(&drv_data->si53xx_lock, flags);
+    if (drv_data->intr_flag) {
+        spin_unlock_irqrestore(&drv_data->si53xx_lock, flags);
+        return POLLPRI;
+    }
+
+    /* if an interrupt did not occur, then return that the device can be
+       read or written to normally
+    */
+    spin_unlock_irqrestore(&drv_data->si53xx_lock, flags);
+    return POLLRDNORM | POLLWRNORM;
+}
+
+static struct class *si53xx_class = NULL;
+
+
+static int si53xx_probe(struct i2c_client * client, const struct i2c_device_id * id)
+{
+    struct si53xx_data *drv_data;
+    int err;
+    struct i2c_adapter *adapter;
+    u8 read_buf;
+    int ret;
+    dev_t devno;
+
+    printk(KERN_INFO "%s:%d i2c=%p\n", __FUNCTION__,__LINE__, client);
+
+    adapter = client->adapter;
+    if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA ))
+       return -ENODEV;
+
+
+    drv_data = kzalloc(sizeof(struct si53xx_data), GFP_KERNEL);
+    if( !drv_data ) {
+        printk(KERN_ALERT "Could not allocated driver memory\n");
+        return -ENOMEM;
+    }
+    memset(drv_data, 0, sizeof(struct si53xx_data));
+
+    if( !si53xx_major ) {
+                err = alloc_chrdev_region(&devno, si53xx_minor_count++,
+                        1, DRIVER_NAME);
+                if (err < 0) {
+                        printk(KERN_ALERT "%s: unable to dynamically allocate a major"" number\n",DRIVER_NAME);
+                        ret = err;
+                        goto exit_free;
+                }
+                si53xx_major = MAJOR(devno);
+        } else {
+                devno = MKDEV(si53xx_major, si53xx_minor_count++);
+                err = register_chrdev_region(devno, 1, DRIVER_NAME);
+                if (err < 0) {
+                        printk(KERN_ALERT "%s: unable to register minor number\n",DRIVER_NAME);
+                        ret = err;
+                        goto exit_free;
+                }
+        }
+    drv_data->si53xx_minor = MINOR(devno);
+
+    drv_data->client = client;
+    i2c_set_clientdata(client,drv_data);
+
+    //Initialize the driver data
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
+    client->dev.platform_data = drv_data;
+#else
+    client->dev.driver_data = drv_data;
+#endif
+
+    cdev_init(&drv_data->cdev, &si53xx_fops);
+    drv_data->cdev.owner = THIS_MODULE;
+    drv_data->cdev.ops = &si53xx_fops;
+    init_waitqueue_head(&drv_data->inq);
+    spin_lock_init(&drv_data->si53xx_lock);
+    SI53xx_INIT_WORK(&drv_data->si53xx_intr_workq, si53xx_intr_handler, &drv_data->si53xx_intr_workq);
+    drv_data->intr_flag = 0;
+    drv_data->si53xx_open_count = 0;
+
+    read_buf = i2c_smbus_read_byte_data(client,SI53XX_REG_ID_1);
+    if(read_buf <= 0)
+        printk(KERN_ERR "%s: Could not read chip ID register: %d\n", DRIVER_NAME, err);
+    drv_data->chip_id = ((u32)read_buf) << 4;
+
+    read_buf = i2c_smbus_read_byte_data(client, SI53XX_REG_ID_2);
+    if(read_buf <= 0)
+       printk(KERN_ERR "%s: Could not read chip ID register: %d\n", DRIVER_NAME, err);
+
+    drv_data->chip_id |= (read_buf & 0xf0) >> 4;
+   drv_data->chip_revision = (read_buf & 0x0f);
+
+    printk(KERN_INFO "%s: Family:Si%d Revision:%d\n",DRIVER_NAME, 5300 + drv_data->chip_id, drv_data->chip_revision);
+
+
+    err = cdev_add(&drv_data->cdev, devno, 1);
+    if(err) {
+        printk(KERN_ALERT "%s: could not register chrdev\n", DRIVER_NAME);
+        ret = err;
+        goto exit_unregister;
+    }
+
+
+    si53xx_class = class_create(THIS_MODULE, DRIVER_NAME);
+    if(IS_ERR(si53xx_class)) {
+        printk(KERN_ERR "Couldn't create device class for si53xx driver\n");
+        ret = PTR_ERR(si53xx_class);
+        goto exit_cdev;
+    }
+
+    drv_data->dev = device_create(si53xx_class, NULL, devno, drv_data, "si53xx");
+    if(IS_ERR(drv_data->dev)) {
+        ret = PTR_ERR(drv_data->dev);
+        goto exit_class;
+    }
+
+    return 0;
+exit_class:
+    class_destroy(si53xx_class);
+exit_cdev:
+    cdev_del(&drv_data->cdev);
+exit_unregister:
+    unregister_chrdev_region(devno, 1);
+exit_free:
+    kfree(drv_data);
+    return ret;
+}
+
+static int si53xx_remove( struct i2c_client *client)
+{
+        struct si53xx_data *drv_data = i2c_get_clientdata(client);
+        int devno;
+        devno = MKDEV(si53xx_major, drv_data->si53xx_minor);
+
+        device_destroy(si53xx_class, devno);
+        class_destroy(si53xx_class);
+        si53xx_class = NULL;
+        unregister_chrdev_region(devno, 1);
+
+        cdev_del(&drv_data->cdev);
+        kfree(drv_data);
+
+        i2c_set_clientdata(client,NULL);
+
+        return 0;
+}
+
+static const struct i2c_device_id si53xx_id[] = {
+        { "si53xx", 0 },
+        { }
+};
+MODULE_DEVICE_TABLE(i2c, si53xx_id);
+
+static struct i2c_driver si53xx_driver = {
+        .driver = {
+                .name  = DRIVER_NAME,
+                .owner = THIS_MODULE,
+        },
+        .probe = si53xx_probe,
+        .remove = __devexit_p(si53xx_remove),
+        .id_table       = si53xx_id,
+};
+
+
+}
+
+static int si53xx_remove( struct i2c_client *client)
+{
+        struct si53xx_data *drv_data = i2c_get_clientdata(client);
+        int devno;
+        devno = MKDEV(si53xx_major, drv_data->si53xx_minor);
+
+        device_destroy(si53xx_class, devno);
+        class_destroy(si53xx_class);
+        si53xx_class = NULL;
+        unregister_chrdev_region(devno, 1);
+
+        cdev_del(&drv_data->cdev);
+        kfree(drv_data);
+
+        i2c_set_clientdata(client,NULL);
+
+        return 0;
+}
+
+static const struct i2c_device_id si53xx_id[] = {
+        { "si53xx", 0 },
+        { }
+};
+MODULE_DEVICE_TABLE(i2c, si53xx_id);
+
+static struct i2c_driver si53xx_driver = {
+        .driver = {
+                .name  = DRIVER_NAME,
+                .owner = THIS_MODULE,
+        },
+        .probe = si53xx_probe,
+        .remove = __devexit_p(si53xx_remove),
+        .id_table       = si53xx_id,
+};
+
+
+
+                                                                                     
+
+static int __init i2c_si53xx_init(void)
+{
+        int status;
+
+        status = i2c_add_driver(&si53xx_driver);
+        if(status)
+                printk(KERN_ALERT "%s: could not register driver\n", DRIVER_NAME);
+
+        printk(KERN_INFO "%s: driver registered\n", DRIVER_NAME);
+        return status;
+}
+
+int si53xx_match_dev(struct device *dev, void *data)
+{
+        return 1;
+}
+
+static void __exit i2c_si53xx_exit(void)
+{
+    i2c_del_driver(&si53xx_driver);
+
+    printk(KERN_ALERT "%s: exiting\n", DRIVER_NAME);
+}
+
+module_init(i2c_si53xx_init);
+module_exit(i2c_si53xx_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Atul Kumar atul_kumar@mindtree.com ");
+MODULE_DESCRIPTION("I2C si53xx driver");
+
