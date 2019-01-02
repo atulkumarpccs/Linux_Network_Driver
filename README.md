@@ -25,5 +25,9 @@ Network Driver
 
 ### Who do I talk to? ###
 
-* Repo owner or admin
+* Repo owner <atulkumarpccs@gmail.com>
 * Other community or team contact
+
+  <https://twitter.com/atulkumarpccs>
+  
+  <https://www.linkedin.com/in/atul-kumar-pccs/>
